@@ -1,0 +1,172 @@
+---
+title: "PASSNYC eda"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+dat <- read.csv('fifa.csv')
+```
+
+This data set was pretty clean from the start.  All the core match info, for example the date and the two teams, was available for every row.
+```{r}
+any(is.na(dat$Date))
+any(is.na(dat$Team))
+any(is.na(dat$Opponent))
+```
+
+This was just for my refernce, so I had a sense of the units for each column.
+``{r}
+names(dat)[5] <- 'Ball.Possession.per'
+names(dat)[14] <- 'Pass.Accuracy.per'
+```
+
+Hmmm okay so there's two rows for every match, containing each team's metrics for the match.  Some of this info is redundant but most of it isn't.  What I'd like to do is have a single row for each match, so I can treat one match as a single "observation" in my analysis scheme.  Fortunately the data set is really well structured, so it's just two adjacent rows per match that I can pick off and manually combine
+```{r}
+row_skip <- seq(1, dim(dat)[1], 2)
+
+# These are the columns that have redundant info, so I just pull one row's data
+better.dat <- data.frame( target = as.integer( dat$Man.of.the.Match[row_skip] == 'Yes' ),
+                         date = dat$Date[row_skip],
+                         round = dat$Round[row_skip],
+                         team1 = dat$Team[row_skip],
+                         team2 = dat$Opponent[row_skip],
+                         team1.ball.poss.per = dat$Ball.Possession.per[row_skip],
+                         team1.pass.acc.per = dat$Pass.Accuracy.per[row_skip]
+                         
+                         )
+```
+
+Okay now I iterate over the remaining columns and split the two team's metrics, and then give each team it's own column for that metric.
+```{r}
+for (col in names(dat)){
+
+    if ( col %in% c('Opponent','Round','Man.of.the.Match','Date','Team','Ball.Possession.per','Pass.Accuracy.per') ){
+
+    }
+
+    else {    
+        team1.stat <- dat[,col][ row_skip ]
+        team2.stat <- dat[,col][ row_skip + 1 ]
+        
+        better.dat[ ,c( paste0( 'team1.', tolower(col) ) )] <- team1.stat
+        better.dat[ ,c( paste0( 'team2.', tolower(col) ) )] <- team2.stat
+
+    }
+            
+}
+```
+
+So we now have half as many rows, but a little less than twice as many columns.
+```{r}
+names(dat)
+dim(dat)
+
+names(better.dat)
+dim(better.dat)
+
+```
+
+Which columns have NAs in them?
+```{r}
+print( apply( better.dat, 2, function(c) {any(is.na(c))} ) )
+```
+
+It looks like the `own.goals` column uses NA when no own goals occurred?  Let's set that to 0.
+```{r}
+better.dat$team1.own.goals[ is.na(better.dat$team1.own.goals) ] <- 0
+better.dat$team2.own.goals[ is.na(better.dat$team2.own.goals) ] <- 0
+```
+
+Okay now the only columns that have NAs are things like times when own goals occurred.  For a first draft model I don't think I want to use that info yet.  I also am going to ignore any categorical variables for now (things like which round the match occurred in or the names of the competing teams).
+```{r}
+cols.w.nas <- names(better.dat)[ which( apply( better.dat, 2, function(c){any(is.na(c))} ) ) ]
+cols.w.factors <- names(better.dat)[ which( !unlist( lapply( better.dat, is.numeric ) ) ) ]
+```
+
+Okay let's make a proper covariance matrix.  I'm going to code matches where team1 had the man of the match as a 1 (ie. a "success") and matches where team2 had him as a 0.  Then I'm going to build covariates that are just `new.covariate = team1.stat-team2.stat`.  We can feed this into a standard Bayesian logistic regression with Laplace prior (which is the Bayesian version of the LASSO penalty for variable selection).  Since there were very rows with nonzero values in Yellow..Red and Red I dropped them from the analysis, since they won't seperate the data very well and so any inference I make about their effect will probably be spurious.
+```{r}
+drop.cols <- c( 'date', 'team1', 'team2', cols.w.nas, cols.w.factors, 'team1.red', 'team2.red', 'team1.yellow...red', 'team2.yellow...red')
+
+x <- better.dat[, !names(better.dat) %in% drop.cols ]
+```
+
+It's usually a good idea to normalize covariates so that all coefficients are on the same scale and can be easily compared.  I'm going to center them and scale them to have unit variance.
+```{r}
+team1.cols <- seq(4,ncol(x),2)
+x <- x[,team1.cols] - x[,team1.cols+1]
+
+# it probably makes the most sense to combine goal.scored and goals.in.pso to a single goal total
+x$team1.goals.tot <- x$team1.goal.scored + x$team1.goals.in.pso
+
+# drop "team1." from the names
+names(x) <- sapply( names(x), function(s) { strsplit(s,'1.')[[1]][2] } )
+
+# drop the goal.scored and goals.in.pso cols since they're colinear with goals.tot
+x <- subset(x, select = -c(goal.scored,goals.in.pso) )
+x <- as.data.frame( apply(x,2,function(c){ (c-mean(c))/sd(c) }) )
+
+
+# convert to matrix?  holdover from an earlier script but whatever
+x <- as.matrix( x )
+```
+
+So let's get a sense for how the model performs by cutting off a third of the data for a holdout.  I'm using Stan to fit the model, which can simultaneously fit a model on the training data and another one on the full data.  We can use the training-data model to predict against the holdout data, and get some sense of how accurately the model performs.  Assuming we can accurately predict the holdout data, then the coefficients from the full-data model can be used to analyse the efficacy of the different metrics in predicting the holdout data.
+```{r}
+# split data for ROC curve
+train.size <- nrow(x) * .3
+data.split <- sort(sample(1:nrow(x),train.size))
+
+x.train <- x[-data.split,]
+x.test <- x[data.split,]
+
+y <- as.matrix( better.dat$target )
+y.train <- y[-data.split]
+y.test <- y[data.split]
+```
+
+As I said above, I'm going to use Stan to  fit my model.  There's a whole second
+```{r}
+library(rstan)
+library(ROCR)
+# Stan preliminaries
+mod.file <- './stan_scripts/logistic_lasso.stan'
+iter  <- 100
+
+N_full <- dim(x)[1]
+N_train <- dim(x.train)[1]
+N_test <- dim(x.test)[1]
+M <- dim(x)[2]
+stan.dat <- list(N_full=N_full,
+                 N_train=N_train,
+                 N_test=N_test,
+                 M=M,
+                 x_full=x,
+                 x_train=x.train,
+                 x_test=x.test,
+                 y_full=as.numeric(y),
+                 y_train=as.numeric(y.train),
+                 y_test=as.numeric(y.test)
+                 )
+
+#Initialize and fit hierarchical model
+print('initialize Stan model and fit...')
+stan.mod <- stan(mod.file, data=stan.dat, chains=4, control=list(adapt_delta=0.85))
+stan.fit <- stan(fit=stan.mod, data=stan.dat, iter=iter)
+print('done')
+
+samps <- extract(stan.fit)
+preds <- apply(samps$p_test,2,mean)
+roc <- performance(prediction(preds, y.test), 'tpr', 'fpr')
+auc <- performance(prediction(preds, y.test), 'auc')
+acc <- performance(prediction(preds, y.test), 'acc')
+
+plot(stan.fit,pars=c('beta_full'))
+dev.new()
+plot(roc)
+print( max(auc@y.values[[1]]) )
+print( max(acc@y.values[[1]]) )
+
